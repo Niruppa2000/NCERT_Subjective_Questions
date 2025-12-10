@@ -10,34 +10,34 @@ from pypdf import PdfReader
 # ============================
 # CONFIG
 # ============================
+
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
+
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-# Use base Flan-T5 for deployment
-# (if you later push your fine-tuned model to HF / repo, change this name)
-GEN_MODEL_NAME = "google/flan-t5-base"
+# 🔥 IMPORTANT: This loads your fine-tuned model folder
+GEN_MODEL_NAME = "flan_t5_ncert_subjective"
 
-TOP_K = 4  # how many chunks to retrieve as context
+TOP_K = 4  # number of context chunks to retrieve
 
 
 # ============================
-# PDF & TEXT UTILITIES
+# PDF EXTRACTION
 # ============================
-def extract_text_from_pdf_filelike(file) -> str:
-    """Read text from a PDF uploaded via Streamlit (BytesIO-like object)."""
+
+def extract_text_from_pdf_filelike(file):
     reader = PdfReader(file)
     pages_text = []
     for page in reader.pages:
         try:
             pages_text.append(page.extract_text() or "")
-        except Exception:
+        except:
             pages_text.append("")
     return "\n".join(pages_text)
 
 
-def build_chunks(text: str, chunk_size: int = 800, overlap: int = 150):
-    """Split large text into overlapping chunks for embedding."""
+def build_chunks(text, chunk_size=800, overlap=150):
     chunks = []
     start = 0
     while start < len(text):
@@ -52,256 +52,211 @@ def build_chunks(text: str, chunk_size: int = 800, overlap: int = 150):
 # ============================
 # LOAD MODELS (CACHED)
 # ============================
-@st.cache_resource(show_spinner="Loading models (embeddings + Flan-T5)...")
+
+@st.cache_resource(show_spinner="Loading embedding + fine-tuned model...")
 def load_models():
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
-    tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME)
-    gen_model = AutoModelForSeq2SeqLM.from_pretrained(GEN_MODEL_NAME).to(device)
+
+    try:
+        # 🔥 Try loading your fine-tuned model from local folder
+        tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME, local_files_only=True)
+        gen_model = AutoModelForSeq2SeqLM.from_pretrained(
+            GEN_MODEL_NAME,
+            local_files_only=True
+        ).to(device)
+        print("Loaded fine-tuned model:", GEN_MODEL_NAME)
+
+    except Exception as e:
+        print("⚠️ Could not load fine-tuned model. Reason:", e)
+        print("➡️ Falling back to base Flan-T5")
+
+        BASE_MODEL = "google/flan-t5-base"
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+        gen_model = AutoModelForSeq2SeqLM.from_pretrained(BASE_MODEL).to(device)
+
     return device, embedder, tokenizer, gen_model
 
 
 # ============================
-# INDEX BUILDING
+# INDEXING + RETRIEVAL
 # ============================
+
 def build_index_from_files(uploaded_files):
-    """
-    Convert uploaded NCERT PDFs into chunked docs.
-    Returns list[dict]: {"doc_id", "chunk_id", "text"}
-    """
     docs = []
     for f in uploaded_files:
-        raw_text = extract_text_from_pdf_filelike(f)
-        chunks = build_chunks(raw_text, CHUNK_SIZE, CHUNK_OVERLAP)
-        for idx, ch in enumerate(chunks):
-            docs.append(
-                {
-                    "doc_id": f.name,
-                    "chunk_id": idx,
-                    "text": ch,
-                }
-            )
+        raw = extract_text_from_pdf_filelike(f)
+        chunks = build_chunks(raw, CHUNK_SIZE, CHUNK_OVERLAP)
+        for i, ch in enumerate(chunks):
+            docs.append({"doc_id": f.name, "chunk_id": i, "text": ch})
     return docs
 
 
 def build_faiss_index(docs, embedder):
-    """Build a FAISS index from chunk embeddings."""
-    emb_dim = embedder.get_sentence_embedding_dimension()
-    index = faiss.IndexFlatL2(emb_dim)
+    dim = embedder.get_sentence_embedding_dimension()
+    index = faiss.IndexFlatL2(dim)
+    vecs = []
 
-    vectors = []
     for d in docs:
-        vec = embedder.encode(d["text"], convert_to_numpy=True, show_progress_bar=False)
-        vectors.append(vec)
+        v = embedder.encode(d["text"], convert_to_numpy=True)
+        vecs.append(v)
 
-    vectors = np.vstack(vectors).astype("float32")
-    index.add(vectors)
+    vecs = np.vstack(vecs).astype("float32")
+    index.add(vecs)
     return index
 
 
-# ============================
-# RETRIEVAL
-# ============================
-def retrieve_context(query: str, index, embedder, docs, top_k: int = TOP_K):
-    """Retrieve top_k relevant chunks from the FAISS index."""
-    q_vec = embedder.encode(query, convert_to_numpy=True).astype("float32")
-    q_vec = np.expand_dims(q_vec, axis=0)
-    distances, indices = index.search(q_vec, top_k)
-    indices = indices[0]
-    retrieved = [docs[i] for i in indices]
-    return retrieved
+def retrieve_context(query, index, embedder, docs, top_k=4):
+    q = embedder.encode(query, convert_to_numpy=True).astype("float32")
+    q = np.expand_dims(q, 0)
+    distances, idxs = index.search(q, top_k)
+    return [docs[i] for i in idxs[0]]
 
 
 # ============================
-# QUESTION POST-PROCESSING
+# QUESTION CLEANING
 # ============================
-def clean_and_extract_questions(raw_text: str, topic: str, num_questions: int):
-    """
-    Turn raw model output (e.g. '1. Q1? 2. Q2? 3. Q3?') into a clean list of questions.
 
-    - Splits using numbering patterns: 1., 2., 3.
-    - Ensures each question ends with '?'
-    - Filters out junk
-    - Fills remaining slots with templates based on the topic
-    """
-    # Normalize spaces/newlines into a single string
+def clean_and_extract_questions(raw_text, topic, num_questions):
     raw = " ".join(raw_text.split()).strip()
 
-    # Capture segments like "1. ... 2. ... 3. ..."
-    segments = []
-    for match in re.finditer(r"\d+\.\s*(.+?)(?=\d+\.|$)", raw):
-        seg = match.group(1).strip()
-        segments.append(seg)
+    # split numbered list: 1. ... 2. ...
+    segments = [
+        m.group(1).strip()
+        for m in re.finditer(r"\d+\.\s*(.+?)(?=\d+\.|$)", raw)
+    ]
 
-    # If no numbered pattern found, treat whole text as one segment
-    if not segments and raw:
+    if not segments:
         segments = [raw]
 
     questions = []
-
     for seg in segments:
-        text = seg.strip()
-
-        # Remove leading bullet if present
-        if text.startswith("- "):
-            text = text[2:].strip()
-
-        # Ignore very short junk
-        if len(text.split()) < 4:
+        if len(seg.split()) < 4:
             continue
+        if not seg.endswith("?"):
+            seg = seg.rstrip(". ") + "?"
+        questions.append(seg)
 
-        # Ensure it ends with '?'
-        if not text.endswith("?"):
-            text = text.rstrip(". ") + "?"
-
-        questions.append(text)
-
-    # ---- Fallback templates based on topic ----
+    # fallback templates
     templates = [
         f"What do you mean by {topic}?",
-        f"Explain {topic} in detail with suitable examples.",
+        f"Explain {topic} with suitable examples.",
         f"Why is {topic} important? Explain.",
         f"Describe {topic} in your own words.",
-        f"List and explain the main features of {topic}.",
-        f"How does {topic} affect our daily life? Explain.",
-        f"Write a short note on {topic}.",
+        f"List and explain the main facts about {topic}.",
     ]
 
-    # Deduplicate while filling up to num_questions
-    seen = set(q.lower() for q in questions)
+    seen = {q.lower() for q in questions}
+
     for t in templates:
         if len(questions) >= num_questions:
             break
         if t.lower() not in seen:
             questions.append(t)
-            seen.add(t.lower())
 
     return questions[:num_questions]
 
 
 # ============================
-# QUESTION GENERATION
+# MAIN QUESTION GENERATOR
 # ============================
-def generate_questions(
-    topic: str,
-    target_class: int,
-    num_questions: int,
-    index,
-    docs,
-    embedder,
-    tokenizer,
-    gen_model,
-    device,
-):
-    """
-    Retrieve context from the uploaded PDFs and generate exam-style questions.
-    """
-    retrieved = retrieve_context(topic, index, embedder, docs, top_k=TOP_K)
-    context_text = "\n\n".join([c["text"] for c in retrieved])
+
+def generate_questions(topic, target_class, num_questions, index, docs, embedder, tokenizer, gen_model, device):
+    retrieved = retrieve_context(topic, index, embedder, docs)
+    context = "\n\n".join([c["text"] for c in retrieved])
 
     prompt = f"""
 You are an experienced NCERT Class {target_class} teacher.
-
-Using ONLY the textbook extract given in CONTEXT, write {num_questions} clear, exam-style questions
+Using ONLY the textbook extract given in CONTEXT, write {num_questions} exam-style questions
 on the topic "{topic}".
 
 Rules:
-- Questions must be simple and meaningful for Class {target_class}.
-- Start with words like: What, Why, How, Explain, Describe, Define, List, etc.
-- Each question must be complete and end with a question mark (?).
-- Write them in this exact format:
+- Questions must be simple, meaningful, and end with '?'
+- Begin with: What, Why, How, Explain, Describe, Define, List
+- Format:
 1. Question 1?
 2. Question 2?
 3. Question 3?
-(only the numbered list, nothing else).
 
 CONTEXT:
-{context_text}
+{context}
 """.strip()
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+
     with torch.no_grad():
-        outputs = gen_model.generate(
+        out = gen_model.generate(
             **inputs,
             max_new_tokens=256,
             num_beams=4,
-            do_sample=False,
-            no_repeat_ngram_size=3,
-            early_stopping=True,
+            no_repeat_ngram_size=3
         )
 
-    raw_text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-    questions = clean_and_extract_questions(raw_text, topic, num_questions)
+    raw = tokenizer.decode(out[0], skip_special_tokens=True).strip()
 
-    questions_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
-    return questions_block, retrieved
+    questions = clean_and_extract_questions(raw, topic, num_questions)
+
+    return questions, retrieved, raw
 
 
 # ============================
 # STREAMLIT UI
 # ============================
+
 def main():
     st.set_page_config(page_title="NCERT Subjective Question Generator", layout="wide")
-    st.title("📚 NCERT Subjective Question Generator (Classes 6–10)")
-
-    st.markdown(
-        """
-Upload **NCERT PDFs (Science) for Classes 6–10**  
-and generate **exam-style subjective questions**, """
-    )
+    st.title("📚 NCERT Subjective Question Generator (Fine-tuned Model)")
 
     uploaded_files = st.file_uploader(
-        "Upload NCERT PDFs (you can select multiple files)",
+        "Upload NCERT PDFs (multiple allowed)",
         type=["pdf"],
-        accept_multiple_files=True,
+        accept_multiple_files=True
     )
 
     col1, col2 = st.columns(2)
-    with col1:
-        target_class = st.selectbox("Select Class", [6, 7, 8, 9, 10], index=0)
-    with col2:
-        num_questions = st.slider("How many questions?", 1, 10, 5)
+    target_class = col1.selectbox("Select Class", [6,7,8,9,10])
+    num_questions = col2.slider("How many questions?", 1, 10, 5)
 
-    topic = st.text_input(
-        "Enter Topic (Example: Balanced diet, Motion, Acids Bases Salts, Ashoka, Harappan civilisation)"
-    )
+    topic = st.text_input("Enter Topic (e.g., Balanced diet, Motion, Photosynthesis, Ashoka)")
 
     if not uploaded_files:
-        st.info("👆 Please upload at least one NCERT PDF to begin.")
+        st.info("Upload at least one NCERT PDF.")
         return
 
     device, embedder, tokenizer, gen_model = load_models()
 
-    with st.spinner("Reading PDFs and building knowledge base..."):
+    with st.spinner("Building knowledge base from PDFs..."):
         docs = build_index_from_files(uploaded_files)
-        if not docs:
-            st.error("No text could be extracted from the uploaded PDFs.")
-            return
         index = build_faiss_index(docs, embedder)
 
-    st.success(f"Indexed {len(docs)} text chunks from {len(uploaded_files)} PDF(s).")
+    st.success(f"Indexed {len(docs)} text chunks.")
 
     if topic and st.button("Generate Questions"):
-        with st.spinner(f"Generating {num_questions} questions..."):
-            questions_text, retrieved = generate_questions(
-                topic=topic,
-                target_class=target_class,
-                num_questions=num_questions,
-                index=index,
-                docs=docs,
-                embedder=embedder,
-                tokenizer=tokenizer,
-                gen_model=gen_model,
-                device=device,
+        with st.spinner("Generating..."):
+            questions, retrieved, raw = generate_questions(
+                topic,
+                target_class,
+                num_questions,
+                index,
+                docs,
+                embedder,
+                tokenizer,
+                gen_model,
+                device
             )
 
-        st.subheader("📄 Generated Questions")
-        st.write(questions_text)
+        st.subheader("📘 Generated Questions")
+        for i, q in enumerate(questions, start=1):
+            st.write(f"**{i}. {q}**")
 
-        with st.expander("Show textbook chunks used"):
-            for r in retrieved:
-                st.markdown(f"**{r['doc_id']} – chunk {r['chunk_id']}**")
-                st.write(r["text"])
+        with st.expander("🔍 Raw Model Output"):
+            st.write(raw)
+
+        with st.expander("📄 Context Chunks Used"):
+            for c in retrieved:
+                st.write(f"**{c['doc_id']} – chunk {c['chunk_id']}**")
+                st.write(c["text"])
                 st.markdown("---")
 
 
