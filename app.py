@@ -12,7 +12,7 @@ from pypdf import PdfReader
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-GEN_MODEL_NAME = "google/flan-t5-base"   # change to flan-t5-large if you have more RAM
+GEN_MODEL_NAME = "google/flan-t5-base"   # use flan-t5-large if you have more RAM
 TOP_K = 5
 
 
@@ -60,7 +60,7 @@ def load_models():
 # INDEX BUILDING
 # ============================
 def build_index_from_files(uploaded_files):
-    """Convert uploaded science PDFs into chunked docs."""
+    """Convert uploaded PDFs into chunked docs."""
     docs = []  # list of {"doc_id", "chunk_id", "text"}
     for f in uploaded_files:
         raw_text = extract_text_from_pdf_filelike(f)
@@ -105,67 +105,72 @@ def retrieve_context(query: str, index, embedder, docs, top_k: int = TOP_K):
 
 
 # ============================
-# HELPER: COSINE SIMILARITY
+# QUESTION POST-PROCESSING
 # ============================
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
-
-
-# ============================
-# CLEAN & FORCE QUESTION FORMAT
-# ============================
-QUESTION_STARTS = (
-    "what", "why", "how", "when", "where", "which",
-    "explain", "describe", "define", "differentiate",
-    "state", "write", "list", "mention", "discuss"
-)
-
-
-def to_question(text: str) -> str:
+def clean_and_extract_questions(raw_text: str, topic: str, num_questions: int):
     """
-    Force the generated text into a clear question form.
-    - Remove extra bullets / numbers
-    - Ensure it starts with a question-like phrase
-    - Ensure it ends with '?'
+    Take raw model output and extract a clean list of questions.
+    If the model doesn't give enough good lines, fill using templates.
     """
-    t = text.strip().replace("\n", " ")
+    lines = [ln.strip() for ln in raw_text.split("\n") if ln.strip()]
+    questions = []
 
-    # remove leading bullets / numbers
-    if t[:2].isdigit() and "." in t[:4]:
-        t = t.split(".", 1)[1].strip()
-    if t.startswith("- "):
-        t = t[2:].strip()
+    for ln in lines:
+        text = ln
 
-    # collapse spaces
-    t = " ".join(t.split())
+        # Remove numbering like "1. " or "2) "
+        if text[0].isdigit():
+            # find first '.' or ')'
+            pos_dot = text.find(".")
+            pos_paren = text.find(")")
+            cut_pos = -1
+            if pos_dot != -1 and pos_paren != -1:
+                cut_pos = min(pos_dot, pos_paren)
+            elif pos_dot != -1:
+                cut_pos = pos_dot
+            elif pos_paren != -1:
+                cut_pos = pos_paren
+            if cut_pos != -1 and cut_pos + 1 < len(text):
+                text = text[cut_pos + 1 :].strip()
 
-    lower = t.lower()
+        # Remove leading bullet
+        if text.startswith("- "):
+            text = text[2:].strip()
 
-    # if it already starts with a question-like word, keep it
-    if not lower.startswith(QUESTION_STARTS):
-        # otherwise, wrap it as "Explain <sentence> ?"
-        # e.g. "acid rain is toxic." -> "Explain why acid rain is toxic."
-        t = t.rstrip(". ")
-        if not lower.startswith("why") and "is" in lower:
-            # crude pattern: "X is Y" -> "Why is X Y?"
-            # Split at first " is "
-            parts = t.split(" is ", 1)
-            if len(parts) == 2:
-                t = f"Why is {parts[0].strip()} is {parts[1].strip()}?"
-            else:
-                t = f"Explain {t}?"
-        else:
-            t = f"Explain {t}?"
-        return t
+        # Ignore very short junk like "On what??"
+        if len(text.split()) < 4:
+            continue
 
-    # ensure it ends with ?
-    if not t.endswith("?"):
-        t = t.rstrip(". ") + "?"
-    return t
+        # Ensure it ends with '?'
+        if not text.endswith("?"):
+            text = text.rstrip(". ") + "?"
+
+        questions.append(text)
+
+    # Fallback: use templates if not enough questions
+    templates = [
+        f"What do you mean by {topic}?",
+        f"Explain {topic} in detail with suitable examples.",
+        f"Why is {topic} important? Explain.",
+        f"Describe {topic} in your own words.",
+        f"List and explain the main features of {topic}.",
+        f"How does {topic} affect our daily life? Explain.",
+        f"Write a short note on {topic}.",
+    ]
+
+    # Add templates until we have at least num_questions
+    for t in templates:
+        if len(questions) >= num_questions:
+            break
+        if t not in questions:
+            questions.append(t)
+
+    # Return exactly num_questions
+    return questions[:num_questions]
 
 
 # ============================
-# QUESTION GENERATION (UNIQUE)
+# QUESTION GENERATION
 # ============================
 def generate_questions(
     topic: str,
@@ -179,83 +184,52 @@ def generate_questions(
     device,
 ):
     """
-    Generate EXACTLY num_questions questions.
-    Uses semantic similarity to avoid repeating the same question.
-    Also forces every output to be a proper question.
+    Generate questions by asking Flan-T5 for a numbered list,
+    then cleaning and enforcing proper question format.
     """
-    # 1) Retrieve context once
+    # 1) Retrieve context
     chunks = retrieve_context(topic, index, embedder, docs, top_k=TOP_K)
     context_text = "\n\n".join([c["text"] for c in chunks])
 
-    questions = []
-    question_vecs = []
+    # 2) Build prompt
+    prompt = f"""
+You are an experienced NCERT Class {target_class} teacher.
 
-    for i in range(num_questions):
-        attempt = 0
-        best_candidate = None
+Using ONLY the textbook extract given in CONTEXT, write {num_questions} clear, exam-style questions
+on the topic "{topic}".
 
-        while attempt < 5:
-            already = ""
-            if questions:
-                already = "\nExisting questions (do NOT repeat these, create something new):\n" + \
-                          "\n".join([f"- {q}" for q in questions])
+Rules:
+- Questions must be simple and meaningful for Class {target_class}.
+- They should start with words like: What, Why, How, Explain, Describe, Define, List, etc.
+- Each question must be complete and end with a question mark (?).
+- Write them in this exact format:
+1. Question 1?
+2. Question 2?
+3. Question 3?
+Do not add any extra sentences before or after the list.
 
-            prompt = f"""
-You are an experienced NCERT Science teacher for Class {target_class}.
-Create ONE NEW, DIFFERENT, exam-style LONG ANSWER question for the topic: "{topic}".
-
-Use ONLY the following NCERT Science textbook context:
-
+CONTEXT:
 {context_text}
-
-{already}
-
-STRICT RULES FOR YOUR OUTPUT:
-- Output MUST be exactly ONE complete question in English.
-- It MUST start with one of: What, Why, How, When, Where, Which, Explain, Describe, Define, Differentiate, State.
-- It MUST end with a question mark "?".
-- Do NOT give the answer.
-- Do NOT add numbering, bullets, or extra text.
 """
 
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
-            with torch.no_grad():
-                outputs = gen_model.generate(
-                    **inputs,
-                    max_new_tokens=96,
-                    do_sample=True,
-                    top_p=0.9,
-                    temperature=0.9,
-                    no_repeat_ngram_size=3,
-                    num_beams=1,
-                    early_stopping=True,
-                )
-            raw = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-            candidate = to_question(raw)  # force proper question shape
-            best_candidate = candidate
+    # 3) Generate
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+    with torch.no_grad():
+        outputs = gen_model.generate(
+            **inputs,
+            max_new_tokens=256,
+            num_beams=4,
+            do_sample=False,
+            no_repeat_ngram_size=3,
+            early_stopping=True,
+        )
 
-            # If it's the first question, accept directly
-            if not questions:
-                break
+    raw_text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
-            # Check similarity with previous questions
-            cand_vec = embedder.encode(candidate, convert_to_numpy=True)
-            sims = [cosine_sim(cand_vec, prev) for prev in question_vecs]
-            max_sim = max(sims) if sims else 0.0
+    # 4) Clean + enforce question format + fallback templates
+    questions = clean_and_extract_questions(raw_text, topic, num_questions)
 
-            # If it's not too similar, accept it
-            if max_sim < 0.85:
-                question_vecs.append(cand_vec)
-                break
-
-            attempt += 1
-
-        # After attempts, accept best_candidate anyway
-        questions.append(best_candidate)
-        if len(question_vecs) < len(questions):
-            q_vec = embedder.encode(best_candidate, convert_to_numpy=True)
-            question_vecs.append(q_vec)
-
+    # Nicely numbered block for display
     questions_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
     return questions_block, chunks
 
@@ -264,52 +238,53 @@ STRICT RULES FOR YOUR OUTPUT:
 # STREAMLIT UI
 # ============================
 def main():
-    st.set_page_config(page_title="NCERT Science Subjective Question Generator", layout="wide")
-    st.title("🔬 NCERT Science Subjective Question Generator (Classes 6–10)")
+    st.set_page_config(page_title="NCERT Subjective Question Generator", layout="wide")
+    st.title("📚 NCERT Subjective Question Generator (Classes 6–10)")
 
     st.markdown(
         """
-Upload **NCERT Science PDFs for Classes 6–10**  
-and generate **exam-style, long-answer subjective questions** like:
+Upload **NCERT PDFs (Science / Social Science / etc.) for Classes 6–10**  
+and generate **exam-style questions** like:
 
-- *What is photosynthesis?*  
-- *How is photosynthesis helpful to plants? Explain?*
+- *What is a balanced diet?*  
+- *How is photosynthesis useful to plants? Explain.*  
+- *What do you mean by the Harappan civilisation?*
 """
     )
 
     uploaded_files = st.file_uploader(
-        "Upload NCERT Science PDFs (you can select multiple files)",
+        "Upload NCERT PDFs (you can select multiple files)",
         type=["pdf"],
         accept_multiple_files=True,
     )
 
     col1, col2 = st.columns(2)
     with col1:
-        target_class = st.selectbox("Select Class", [6, 7, 8, 9, 10], index=1)
+        target_class = st.selectbox("Select Class", [6, 7, 8, 9, 10], index=0)
     with col2:
         num_questions = st.slider("How many questions?", 1, 10, 3)
 
     topic = st.text_input(
-        "Enter Topic (Example: Nutrition in Plants, Acids Bases Salts, Motion, Electricity)"
+        "Enter Topic (Example: Balanced diet, Motion, Acids Bases Salts, Ashoka, Mughal Empire)"
     )
 
     if not uploaded_files:
-        st.info("👆 Please upload at least one NCERT **Science** PDF to begin.")
+        st.info("👆 Please upload at least one NCERT PDF to begin.")
         return
 
     device, embedder, tokenizer, gen_model = load_models()
 
-    with st.spinner("Reading PDFs and building Science knowledge base..."):
+    with st.spinner("Reading PDFs and building knowledge base..."):
         docs = build_index_from_files(uploaded_files)
         if not docs:
             st.error("No text could be extracted from the uploaded PDFs.")
             return
         index = build_faiss_index(docs, embedder)
 
-    st.success(f"Indexed {len(docs)} text chunks from {len(uploaded_files)} Science PDF(s).")
+    st.success(f"Indexed {len(docs)} text chunks from {len(uploaded_files)} PDF(s).")
 
     if topic and st.button("Generate Questions"):
-        with st.spinner(f"Generating {num_questions} science questions..."):
+        with st.spinner(f"Generating {num_questions} questions..."):
             questions_text, retrieved = generate_questions(
                 topic=topic,
                 target_class=target_class,
@@ -322,7 +297,7 @@ and generate **exam-style, long-answer subjective questions** like:
                 device=device,
             )
 
-        st.subheader("📄 Generated Science Questions")
+        st.subheader("📄 Generated Questions")
         st.write(questions_text)
 
         with st.expander("Show textbook chunks used"):
