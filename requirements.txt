@@ -1,8 +1,10 @@
-streamlit
-sentence-transformers
-faiss-cpu
-transformers
-torch==2.0.1
-pypdf
+streamlit==1.28.0
+transformers==4.40.0
+sentencepiece==0.1.99
+sentence-transformers==2.2.2
+torch>=1.13.0
+pypdf==4.4.2
+faiss-cpu==1.7.4
 numpy
+tqdm
 
