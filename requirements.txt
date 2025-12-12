@@ -1,6 +1,9 @@
-numpy==1.24.4
-pandas==2.1.4
+# minimal + pinned to avoid source builds on Streamlit Cloud
+numpy==1.25.3
+pandas==2.2.0
 streamlit==1.26.0
+
+
 
 
 
